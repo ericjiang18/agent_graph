@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+# from torch.utils.data import DataLoader, TensorDataset # Standard DataLoader
 import torch.optim as optim
 import torch.nn as nn
 import os
@@ -11,9 +11,14 @@ gdesigner_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
 if gdesigner_root not in sys.path:
     sys.path.insert(0, gdesigner_root)
 
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader as PyGDataLoader # PyG DataLoader
+from torch_geometric.utils import from_dense
+
+
 from GDesigner.gtd.proxy_reward_model import ProxyRewardModel
-from GDesigner.gtd.metrics_and_datasets import create_proxy_training_data
-# Using placeholder from metrics_and_datasets for data generation
+# metrics_and_datasets.py create_proxy_training_data is too high-level for this direct use.
+# We will construct PyG Data objects directly here.
 
 def main_train_proxy():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,83 +26,55 @@ def main_train_proxy():
 
     # --- Configuration ---
     # Proxy Model parameters
-    num_nodes = 10  # Max number of nodes in graphs
-    node_feature_dim = 32 # Must match features used by proxy model
-    condition_dim = 64    # Must match condition info used by proxy
+    num_nodes_avg = 10  # Average number of nodes, can vary per graph
+    node_feature_dim = 32
+    condition_dim = 64
     gnn_hidden_dim = 64
     gnn_layers = 2
     mlp_hidden_dim = 128
-    # Define the order and number of reward components the proxy model will predict
     reward_component_names = ['utility', 'cost', 'vulnerability']
     num_reward_components = len(reward_component_names)
 
     # Training parameters
-    num_train_samples = 512 # Number of dummy training samples for proxy model
-    batch_size = 64
-    epochs = 15 # Example epochs
+    num_train_samples = 512
+    batch_size = 64 # PyG DataLoader batch_size
+    epochs = 15
     learning_rate = 1e-3
 
-    # --- Dataset Preparation (Placeholder) ---
-    # In a real scenario, load pre-generated
-    # (task_cond_embed, node_feat_init, A_adj_matrix, true_reward_components_vector) tuples
-    print("Generating dummy proxy model training data (using placeholder)...")
+    # --- Dataset Preparation (for PyG) ---
+    print("Generating dummy proxy model training data (for PyG)...")
 
-    # Dummy raw data and embedding functions for the placeholder
-    dummy_raw_data_proxy = [{'task_text': f'task_{i}', 'agent_config': {'type': 'default'}} for i in range(num_train_samples)]
-
-    def _dummy_embedding_func_proxy(task_text, agent_config):
-        cond_embed = torch.randn(condition_dim)
-        node_feats = torch.randn(num_nodes, node_feature_dim)
-        return cond_embed, node_feats
-
-    def _dummy_mas_reward_runner(raw_item, adj_matrix):
-        # Returns a dict of reward components
-        # Ensure this dict matches `reward_component_names` in order and content
-        return {
-            'utility': torch.rand(1).item(),
-            'cost': adj_matrix.sum().item() / (num_nodes * (num_nodes -1) + 1e-5), # Normalized cost
-            'vulnerability': torch.rand(1).item() * 0.5 # Lower vulnerability is better
-        }
-
-    def _dummy_topology_sampler(max_n):
-        return (torch.rand(max_n, max_n) > (0.3 + torch.rand(1).item()*0.4) ).float() # Sample diverse densities
-
-    # The placeholder `create_proxy_training_data` returns a list of tuples.
-    # Each tuple: (task_cond_embed, node_feat_init, A_adj_matrix, true_rewards_vector)
-    # For demo, generating data directly into tensors for TensorDataset.
-
-    all_cond_embeds_proxy = []
-    all_node_feats_proxy = []
-    all_adj_matrices_proxy = []
-    all_true_rewards_proxy = []
-
+    data_list = []
     for i in range(num_train_samples):
-        raw_item = dummy_raw_data_proxy[i]
-        cond_embed, node_feats = _dummy_embedding_func_proxy(raw_item['task_text'], raw_item['agent_config'])
+        # Simulate variable number of nodes per graph
+        current_num_nodes = num_nodes_avg - 2 + (i % 5) # e.g. 8 to 12 nodes
 
-        adj_matrix = _dummy_topology_sampler(num_nodes)
-        rewards_dict = _dummy_mas_reward_runner(raw_item, adj_matrix)
+        # Node features (x)
+        x = torch.randn(current_num_nodes, node_feature_dim)
 
-        # Ensure rewards_vector is in the order defined by reward_component_names
-        rewards_vector = torch.tensor([rewards_dict[name] for name in reward_component_names], dtype=torch.float32)
+        # Adjacency matrix and edge_index
+        adj_matrix = (torch.rand(current_num_nodes, current_num_nodes) > (0.3 + torch.rand(1).item()*0.4)).float()
+        edge_index, _ = from_dense(adj_matrix)
 
-        all_cond_embeds_proxy.append(cond_embed)
-        all_node_feats_proxy.append(node_feats)
-        all_adj_matrices_proxy.append(adj_matrix)
-        all_true_rewards_proxy.append(rewards_vector)
+        # Condition vector (graph-level attribute)
+        # Shape: (1, condition_dim) to be correctly handled by PyG Batch for stacking
+        condition_vec = torch.randn(1, condition_dim)
 
-    stacked_cond_embeds = torch.stack(all_cond_embeds_proxy)
-    stacked_node_feats = torch.stack(all_node_feats_proxy)
-    stacked_adj_matrices = torch.stack(all_adj_matrices_proxy)
-    stacked_true_rewards = torch.stack(all_true_rewards_proxy)
+        # True rewards (graph-level attribute, e.g., data.y or data.true_rewards)
+        # Shape: (1, num_reward_components)
+        # Dummy rewards for utility, cost, vulnerability
+        utility = torch.rand(1).item()
+        cost = adj_matrix.sum().item() / (current_num_nodes * (current_num_nodes -1) + 1e-5) # Normalized
+        vulnerability = torch.rand(1).item() * 0.5
+        true_rewards_vec = torch.tensor([[utility, cost, vulnerability]], dtype=torch.float32)
 
-    print(f"Proxy Data Shapes: Cond: {stacked_cond_embeds.shape}, NodeFeats: {stacked_node_feats.shape}, Adj: {stacked_adj_matrices.shape}, Rewards: {stacked_true_rewards.shape}")
+        data = Data(x=x, edge_index=edge_index, condition=condition_vec, true_rewards=true_rewards_vec)
+        data_list.append(data)
 
-    # Order for TensorDataset: node_features, adj_matrix, condition, true_rewards
-    # This order matches the example training loop in proxy_reward_model.py
-    dataset = TensorDataset(stacked_node_feats, stacked_adj_matrices, stacked_cond_embeds, stacked_true_rewards)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    print(f"Created DataLoader for proxy training with {len(dataloader)} batches.")
+    # Use PyG DataLoader
+    pyg_dataloader = PyGDataLoader(data_list, batch_size=batch_size, shuffle=True)
+    print(f"Created PyG DataLoader for proxy training with {len(pyg_dataloader)} batches.")
+
 
     # --- Initialize Proxy Reward Model ---
     print("Initializing ProxyRewardModel...")
@@ -114,38 +91,44 @@ def main_train_proxy():
 
     # --- Optimizer and Loss Function ---
     optimizer = optim.Adam(proxy_model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss() # Mean Squared Error for reward regression
+    criterion = nn.MSELoss()
 
     # --- Start Training ---
-    print("Starting proxy model training...")
+    print("Starting proxy model training with PyG data...")
     proxy_model.train()
     for epoch in range(epochs):
         total_loss = 0
-        for batch_idx, (node_feat_b, adj_mat_b, cond_b, true_rewards_b) in enumerate(dataloader):
-            node_feat_b = node_feat_b.to(device)
-            adj_mat_b = adj_mat_b.to(device)
-            cond_b = cond_b.to(device)
-            true_rewards_b = true_rewards_b.to(device)
+        for batch_idx, pyg_batch_data in enumerate(pyg_dataloader):
+            pyg_batch_data = pyg_batch_data.to(device)
+
+            # True rewards are on pyg_batch_data.true_rewards
+            # It should be (batch_size, num_reward_components) after PyG batching
+            true_rewards_b = pyg_batch_data.true_rewards
+            if true_rewards_b.ndim == 3 and true_rewards_b.shape[1] == 1: # Squeeze if necessary
+                true_rewards_b = true_rewards_b.squeeze(1)
+
 
             optimizer.zero_grad()
-            pred_rewards_b = proxy_model(node_feat_b, adj_mat_b, cond_b)
+            # Proxy model now expects a PyG Batch object
+            pred_rewards_b = proxy_model(pyg_batch_data)
+
             loss = criterion(pred_rewards_b, true_rewards_b)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-            if batch_idx % 20 == 0: # Log every 20 batches
-                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
+            if batch_idx % 20 == 0:
+                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}/{len(pyg_dataloader)}, Loss: {loss.item():.4f}")
 
-        avg_epoch_loss = total_loss / len(dataloader)
+        avg_epoch_loss = total_loss / len(pyg_dataloader)
         print(f"Epoch {epoch+1}/{epochs} completed. Average Proxy Training Loss: {avg_epoch_loss:.4f}")
 
     proxy_model.eval()
     print("Proxy model training finished.")
 
     # --- Save Model (Example) ---
-    # torch.save(proxy_model.state_dict(), "trained_proxy_reward_model.pth")
-    # print("Trained proxy model weights (conceptually) saved to trained_proxy_reward_model.pth")
+    # torch.save(proxy_model.state_dict(), "trained_proxy_reward_model_pyg.pth")
+    # print("Trained proxy model weights (conceptually) saved to trained_proxy_reward_model_pyg.pth")
 
 if __name__ == "__main__":
     main_train_proxy()
